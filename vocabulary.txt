@@ -1,0 +1,35 @@
+# Push-to-Talk Vocabulary
+# Add words and phrases here to improve transcription accuracy.
+# One per line. Whisper will learn your style from these.
+#
+# Examples:
+#   Project names:  RedTeam, Vercel, Next.js
+#   Tech terms:     API endpoint, serverless, deploy
+#   People names:   specific names you mention often
+#   Portuguese:     palavras que voce usa frequentemente
+
+# -- Tech --
+Claude Code
+Vercel
+Next.js
+TypeScript
+JavaScript
+API
+GitHub
+Turborepo
+Airtable
+Prisma
+Neon
+
+# -- Projects --
+RedTeam
+Salendi
+Amplex
+Proflyacademy
+TechRefurb
+Greensales
+
+# -- Common phrases --
+push to production
+pull request
+code review
