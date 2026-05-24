@@ -20,6 +20,7 @@ import datetime
 import rumps
 import objc
 from AppKit import NSImage, NSImageSymbolConfiguration, NSStatusBar, NSMakeSize
+from PyObjCTools import AppHelper
 from pynput import keyboard
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +54,28 @@ HALLUCINATIONS = [
 ]
 
 
+def collapse_repetitions(text, run_limit=4):
+    """Drop runs of the same word repeated run_limit+ times in a row.
+
+    Whisper hallucinates degenerate output like "de de de de ..." (often when
+    the audio is silent/truncated). Such a run is removed entirely while any
+    surrounding real speech is preserved. Legitimate short repeats (e.g.
+    "no no no") are kept.
+    """
+    words = text.split()
+    out, i, n = [], 0, len(words)
+    while i < n:
+        key = words[i].lower().strip(".,!?;:¿¡\"'()[]…")
+        j = i
+        while j < n and words[j].lower().strip(".,!?;:¿¡\"'()[]…") == key:
+            j += 1
+        # Drop the run only if it's a real word repeated past the limit.
+        if not (key and (j - i) >= run_limit):
+            out.extend(words[i:j])
+        i = j
+    return " ".join(out)
+
+
 def clean_text(text):
     """Remove Whisper hallucinations and clean up output."""
     text = text.strip()
@@ -62,6 +85,7 @@ def clean_text(text):
     for phrase in HALLUCINATIONS:
         if lower.endswith(phrase):
             text = text[:len(text) - len(phrase)].strip()
+    text = collapse_repetitions(text)
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
@@ -88,18 +112,28 @@ def load_vocabulary():
 
 
 def get_recent_history(n=5):
-    """Get last N transcriptions as context."""
+    """Get last N *clean* transcriptions as context.
+
+    Repetition hallucinations are stripped and degenerate/empty entries are
+    skipped so they can never feed back into the Whisper prompt (which would
+    prime even more repetition — a self-poisoning loop).
+    """
     if not os.path.exists(HISTORY_FILE):
         return ""
     with open(HISTORY_FILE) as f:
         lines = f.readlines()
-    # Extract just the text (remove timestamps)
     texts = []
-    for line in lines[-n:]:
+    for line in lines:
         match = re.match(r'\[.*?\] (.+)', line.strip())
-        if match:
-            texts.append(match.group(1))
-    return " ".join(texts)
+        if not match:
+            continue
+        cleaned = collapse_repetitions(match.group(1)).strip()
+        # Skip anything that collapsed to nothing or has no real content.
+        if len(cleaned.split()) < 2:
+            continue
+        if not texts or texts[-1] != cleaned:  # drop consecutive duplicates
+            texts.append(cleaned)
+    return " ".join(texts[-n:])
 
 
 def build_initial_prompt():
@@ -193,8 +227,7 @@ class PushToTalkApp(rumps.App):
             stderr=subprocess.DEVNULL,
         )
         beep("Tink")
-        self._set_sf_icon("mic.fill")
-        self.status_item.title = "Recording... release to stop"
+        self._ui(icon="mic.fill", status="Recording... release to stop")
 
     def stop_and_transcribe(self):
         self.recording = False
@@ -204,8 +237,7 @@ class PushToTalkApp(rumps.App):
             self.rec_process.wait()
             self.rec_process = None
         beep("Pop")
-        self._set_sf_icon("ellipsis.circle")
-        self.status_item.title = "Transcribing..."
+        self._ui(icon="ellipsis.circle", status="Transcribing...")
         threading.Thread(target=self.transcribe, daemon=True).start()
 
     def transcribe(self):
@@ -217,10 +249,12 @@ class PushToTalkApp(rumps.App):
             # Escape single quotes for the inline python command
             safe_prompt = prompt.replace("'", "\\'")
 
+            # condition_on_previous_text=False stops Whisper from looping on
+            # its own output within a clip (another repetition source).
             if safe_prompt:
-                whisper_cmd = f"import mlx_whisper; r = mlx_whisper.transcribe('{tmp_wav}', initial_prompt='{safe_prompt}', path_or_hf_repo='{self.model_repo}'); print(r['text'])"
+                whisper_cmd = f"import mlx_whisper; r = mlx_whisper.transcribe('{tmp_wav}', initial_prompt='{safe_prompt}', condition_on_previous_text=False, path_or_hf_repo='{self.model_repo}'); print(r['text'])"
             else:
-                whisper_cmd = f"import mlx_whisper; r = mlx_whisper.transcribe('{tmp_wav}', path_or_hf_repo='{self.model_repo}'); print(r['text'])"
+                whisper_cmd = f"import mlx_whisper; r = mlx_whisper.transcribe('{tmp_wav}', condition_on_previous_text=False, path_or_hf_repo='{self.model_repo}'); print(r['text'])"
 
             result = subprocess.run(
                 ["/Users/user/.pyenv/versions/3.11.9/bin/python3", "-c", whisper_cmd],
@@ -235,26 +269,32 @@ class PushToTalkApp(rumps.App):
             # Copy to clipboard
             subprocess.run(["pbcopy"], input=text.encode(), check=True)
 
-            # Auto-type
+            # Auto-type (Quartz CGEvents are thread-safe; OK off the main thread)
             if self.auto_type:
                 self.type_text(text)
 
             # Save to history
             self.save_history(text)
 
-            # Show notification
-            rumps.notification(
-                "Transcribed",
-                f"{'Typed + ' if self.auto_type else ''}Copied to clipboard",
-                text,
-            )
-            self.last_text_item.title = f"Last: {text[:60]}{'...' if len(text) > 60 else ''}"
-            self.finish("Ready — Hold Right ⌘ to record")
+            # All AppKit UI updates must happen on the main thread.
+            AppHelper.callAfter(self._on_transcribed, text)
 
         except subprocess.TimeoutExpired:
             self.finish("Transcription timed out")
         except Exception as e:
             self.finish(f"Error: {e}")
+
+    def _on_transcribed(self, text):
+        """Main-thread UI updates after a successful transcription."""
+        rumps.notification(
+            "Transcribed",
+            f"{'Typed + ' if self.auto_type else ''}Copied to clipboard",
+            text,
+        )
+        self.last_text_item.title = (
+            f"Last: {text[:60]}{'...' if len(text) > 60 else ''}"
+        )
+        self.finish("Ready — Hold Right ⌘ to record")
 
     def type_text(self, text):
         """Simulate Cmd+V using Quartz CGEvents (no osascript needed)."""
@@ -286,8 +326,23 @@ class PushToTalkApp(rumps.App):
 
     def finish(self, status):
         self.transcribing = False
-        self._set_sf_icon("mic")
-        self.status_item.title = status
+        self._ui(icon="mic", status=status)
+
+    def _ui(self, icon=None, status=None):
+        """Schedule a UI update on the main thread.
+
+        AppKit objects (the status item, its button/image) may only be touched
+        from the main thread. on_press/on_release run on the pynput listener
+        thread and transcribe() runs on a worker thread, so every UI mutation
+        is marshalled here via the main run loop.
+        """
+        AppHelper.callAfter(self._apply_ui, icon, status)
+
+    def _apply_ui(self, icon, status):
+        if icon is not None:
+            self._set_sf_icon(icon)
+        if status is not None:
+            self.status_item.title = status
 
     def _set_sf_icon(self, symbol_name):
         """Set menu bar icon to an SF Symbol."""
